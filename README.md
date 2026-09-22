@@ -1,6 +1,11 @@
 # p300-mixed-effects
 Reproducible implementation of a mixed-effects framework for scenario-aware P300 analysis with principled epoch aggregation, validated across 3 public datasets
 
+[Accepted at Brain Informatics (BI'26)]
+
+<img width="3432" height="2213" alt="pipeline_conf (1)" src="https://github.com/user-attachments/assets/0e92a284-5e05-4178-833e-35307c24575a" />
+
+
 Note:
 Some of the data were shifted to azure cloud from AWS, so the data fetching may differ in a few files, but the algorithm follows the pipeline
 
