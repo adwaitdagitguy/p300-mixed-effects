@@ -1,6 +1,10 @@
 # p300-mixed-effects
-Reproducible implementation of a mixed-effects framework for scenario-aware P300 analysis with principled epoch aggregation, validated across 3 public datasets
+Reproducible implementation of a mixed-effects framework for scenario-aware P300 analysis with principled epoch aggregation, validated across 3 public datasets.
 
+A Mixed-Effects Architecture for P300 Scenario
+Analysis with Principled Epoch Aggregation
+
+by: Adwait Patkhedkar, Komal Tarachandani and Kiran Talele
 [Accepted at Brain Informatics (BI'26)]
 
 <img width="3432" height="2213" alt="pipeline_conf (1)" src="https://github.com/user-attachments/assets/0e92a284-5e05-4178-833e-35307c24575a" />
