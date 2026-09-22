@@ -1,40 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-giga_task_performance_sensitivity.py
-
-Addresses Reviewer Comment 3:
-"In particular, the GIGA task-performance score uses manually chosen weights of 1, −0.5
- and −0.3 for accuracy, misses and drowsiness. The authors themselves acknowledge that
- these weights are heuristic. Sensitivity analysis would help demonstrate that the
- conclusions are not dependent on these particular choices."
-
-Methodology:
-  1. Load and transpose GigaDB questionnaire/behavioral data (54 subjects).
-  2. Define the baseline composite score:
-       Score = 1.0 * norm(BCI_performance) - 0.5 * norm(trials_missed) - 0.3 * norm(nodded_off)
-     yielding 3 clusters (Low, Mid, High performers) with KMeans (k=3).
-  3. Grid Sweep across a broad parameter space of weights:
-       w_accuracy in [0.5, 0.8, 1.0, 1.2, 1.5]
-       w_misses   in [0.1, 0.3, 0.5, 0.7, 1.0]
-       w_drowsy   in [0.0, 0.1, 0.3, 0.5, 0.7]   (including 0 = no drowsiness penalty)
-     Plus Data-Driven Objective Weighting Schemes:
-       - PCA (PC1 projection of the 3 components)
-       - Equal weighting (1, -1, -1)
-       - Accuracy only (1, 0, 0)
-       - Accuracy + Misses only (1, -1, 0)
-  4. Stability Metrics for each weight configuration:
-       - Adjusted Rand Index (ARI) against the baseline clustering
-       - Normalized Mutual Information (NMI) against the baseline clustering
-       - Spearman rank correlation of composite scores vs baseline score
-       - Percentage of subjects retaining their exact baseline cluster assignment
-  5. Outputs:
-       - Sensitivity summary table & statistics
-       - Publication-quality heatmap / distribution figures:
-           giga_task_performance_sensitivity_heatmap.png
-           giga_weight_sweep_correlations.png
-       - Saved CSV report: giga_task_performance_weight_sensitivity.csv
-"""
-
 import os
 import argparse
 import numpy as np
@@ -219,7 +182,7 @@ def run_sensitivity_analysis(csv_path="giga.csv", out_dir="."):
     res_df.to_csv(out_csv, index=False)
 
     # =============================================================
-    # 2. Print Summary Statistics for Reviewer Rebuttal
+    # 2. Print Summary Statistics
     # =============================================================
     grid_res = res_df[res_df['type'] == 'Grid Sweep']
 
@@ -337,7 +300,6 @@ def run_sensitivity_analysis(csv_path="giga.csv", out_dir="."):
     plt.close()
     print(f"[saved] Correlation distribution plot -> {fig2_path}")
 
-    print("\nAnalysis complete. Use these statistics and figures in your response to Reviewer Comment 3.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
