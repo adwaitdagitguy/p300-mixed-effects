@@ -155,13 +155,13 @@ adaptive_meta = {
 # --- 4. Dataset configs ---
 dataset_configs = {
     'korean': {
-        'enabled':         False,
+        'enabled':         True,
         'ft_prefix':      'korean/parquet_ft',
         'binned_prefix':  'korean/parquet_binned_both',
         'epoch_type':     'target',
         'channels':       [
             'fp1', 'f7', 'f3', 'fc1', 'fc5', 'c4', 'cp2', 'fc6',
-            'f8', 'f4', 'fc2', 'fp2', 'fz', 'cz', 'cp1', 'pz', 'oz', 'po4', 'p4'
+            'f8', 'f4', 'fc2', 'fp2', 'fz', 'cz', 'cp1', 'pz'
         ],
         'features':       None,
         'group_cols':     ['subject_id', 'run_type', 'run_id'],
@@ -170,7 +170,7 @@ dataset_configs = {
         'metadata':       korean_meta,
     },
     'giga': {
-        'enabled':         False,
+        'enabled':         True,
         'ft_prefix':      'giga_preprocessed/parquet_ft',
         'binned_prefix':  'giga_preprocessed/parquet_binned_both',
         'epoch_type':     'non-target',
@@ -321,6 +321,37 @@ def get_or_create_binned_ft(ft_prefix, binned_prefix, group_cols, k,
 
     return df_binned
 
+# ==============================================================================
+# 5. Singularity Criterion Definition (Scale-Aware / Numerical Precision)
+# ==============================================================================
+# In mixed-effects models (LME), singularity indicates that the random effects
+# variance-covariance matrix lies on the boundary of the parameter space.
+#
+# WHY SCALE-INDEPENDENT CRITERIA ARE NECESSARY:
+# EEG features vary across physical units:
+#   - Raw voltages (V): feature variances are ~ 10^-12 to 10^-11 V^2.
+#     An absolute threshold (e.g. 1e-5) would erroneously drop 100% of valid fits.
+#   - Microvolts squared (uV^2) or power: variances can exceed 10^2 to 10^4.
+#     An absolute threshold would fail to detect true boundary collapse.
+#
+# DEFINITION BASED ON NUMERICAL PRECISION AND MODEL SCALE:
+# We evaluate boundary singularity using scale-invariant metrics:
+#   - sigma_u^2: between-subject random intercept variance (fit.cov_re)
+#   - sigma_e^2: residual within-subject variance (fit.scale)
+#   - Intraclass Correlation Coefficient: ICC = sigma_u^2 / (sigma_u^2 + sigma_e^2)
+#   - Relative variance: rel_var = sigma_u^2 / sigma_e^2
+#
+# A fit is classified as NUMERICALLY BOUNDARY-SINGULAR if:
+#   1. Non-positive variance: sigma_u^2 <= 0, or is NaN / None.
+#   2. Scale-relative boundary: ICC <= ICC_BOUNDARY_TOL (1e-5) or rel_var <= REL_VAR_BOUNDARY_TOL (1e-5).
+#      At ICC <= 1e-5, < 0.001% of variance is between-subject, placing the parameter
+#      on the numerical boundary floor of the optimizer. (Note: in lme4, isSingular()
+#      uses a Cholesky factor tolerance theta <= 1e-4, which corresponds to rel_var <= 1e-8).
+#   3. Degenerate parameter covariance: fit.bse contains NaNs or Infs (singular Hessian).
+# ==============================================================================
+ICC_BOUNDARY_TOL     = 1e-5
+REL_VAR_BOUNDARY_TOL = 1e-5
+
 def fit_one(chan, feat, df, group_var, run_covariate):
     warnings.simplefilter('ignore')
     df_chan = df[df['channel_name'] == chan]
@@ -331,23 +362,90 @@ def fit_one(chan, feat, df, group_var, run_covariate):
     })
     d['Bin'] = d['Bin'].astype('category')
 
+    res_record = {
+        'chan': chan,
+        'feature': feat,
+        'group_var': group_var,
+        'converged': False,
+        're_var': np.nan,
+        'resid_var': np.nan,
+        'icc': np.nan,
+        'rel_var': np.nan,
+        'is_singular': True,
+        'singular_reason': None,
+        'p_interaction': None,
+        'p_main': None,
+        'p_bin': None,
+        'error': None
+    }
+
     try:
         formula = f"Value ~ {group_var} * Bin + {run_covariate}"
         fit     = smf.mixedlm(formula, d, groups=d['Subject']).fit(
                       reml=True, method='lbfgs')
-        anova   = fit.wald_test_terms().summary_frame()
-        return {
-            'chan': chan, 'feature': feat,
-            'p_interaction': anova.loc[f'{group_var}:Bin', 'P>chi2'],
-            'p_main':        anova.loc[group_var,          'P>chi2'],
-            'p_bin':         anova.loc['Bin',              'P>chi2'],
-        }
+
+        # 1. Optimizer convergence status
+        converged = bool(getattr(fit, 'converged', False))
+        res_record['converged'] = converged
+
+        # 2. Record random-intercept variance and residual variance for EVERY fit
+        try:
+            re_var = float(np.asarray(fit.cov_re).item())
+        except Exception:
+            re_var = np.nan
+        res_record['re_var'] = re_var
+
+        try:
+            resid_var = float(fit.scale)
+        except Exception:
+            resid_var = np.nan
+        res_record['resid_var'] = resid_var
+
+        # 3. Compute scale-free ICC and relative variance ratio
+        if not np.isnan(re_var) and not np.isnan(resid_var) and resid_var > 0:
+            total_var = re_var + resid_var
+            res_record['icc'] = re_var / total_var if total_var > 0 else 0.0
+            res_record['rel_var'] = re_var / resid_var
+        else:
+            res_record['icc'] = np.nan
+            res_record['rel_var'] = np.nan
+
+        # 4. Check numerical boundary singularity
+        is_singular = False
+        singular_reason = None
+
+        if np.isnan(re_var) or re_var <= 0:
+            is_singular = True
+            singular_reason = 'non_positive_re_var'
+        elif res_record['icc'] <= ICC_BOUNDARY_TOL or res_record['rel_var'] <= REL_VAR_BOUNDARY_TOL:
+            is_singular = True
+            singular_reason = f'boundary_icc_le_{ICC_BOUNDARY_TOL}'
+        elif hasattr(fit, 'bse') and (fit.bse.isna().any() or np.isinf(fit.bse).any()):
+            is_singular = True
+            singular_reason = 'singular_hessian_bse_nan'
+
+        res_record['is_singular'] = is_singular
+        res_record['singular_reason'] = singular_reason
+
+        # Gate out non-converged or singular models from hypothesis tests
+        if not converged:
+            res_record['error'] = 'not_converged'
+            return res_record
+
+        if is_singular:
+            res_record['error'] = singular_reason
+            return res_record
+
+        # 5. Extract Wald chi2 ANOVA terms for valid, non-singular models
+        anova = fit.wald_test_terms().summary_frame()
+        res_record['p_interaction'] = anova.loc[f'{group_var}:Bin', 'P>chi2']
+        res_record['p_main']        = anova.loc[group_var,          'P>chi2']
+        res_record['p_bin']         = anova.loc['Bin',              'P>chi2']
+        return res_record
+
     except Exception as e:
-        return {
-            'chan': chan, 'feature': feat,
-            'p_interaction': None, 'p_main': None,
-            'p_bin': None, 'error': str(e)
-        }
+        res_record['error'] = str(e)
+        return res_record
 
 def run_lme(df, group_var, run_covariate, features, channels):
     tasks = [(chan, feat) for chan in channels for feat in features]
@@ -355,10 +453,37 @@ def run_lme(df, group_var, run_covariate, features, channels):
         delayed(fit_one)(chan, feat, df, group_var, run_covariate)
         for chan, feat in tasks
     )
-    gate_df = pd.DataFrame(results).dropna(subset=['p_interaction', 'p_main'])
+    raw_df = pd.DataFrame(results)
+
+    n_total = len(raw_df)
+    n_conv = int(raw_df['converged'].sum())
+    n_not_conv = n_total - n_conv
+    pct_not_conv = (n_not_conv / n_total * 100) if n_total > 0 else 0.0
+
+    n_singular = int(raw_df['is_singular'].sum())
+    pct_singular = (n_singular / n_total * 100) if n_total > 0 else 0.0
+
+    valid_mask = (raw_df['converged']) & (~raw_df['is_singular']) & raw_df['p_main'].notna() & raw_df['p_interaction'].notna()
+    gate_df = raw_df[valid_mask].copy()
+    n_survived = len(gate_df)
+    pct_survived = (n_survived / n_total * 100) if n_total > 0 else 0.0
+
+    print(f"    LME Fits Audit [{group_var}]: {n_survived}/{n_total} survived ({pct_survived:.1f}%) | "
+          f"Singular: {n_singular} ({pct_singular:.1f}%) | "
+          f"Non-converged: {n_not_conv} ({pct_not_conv:.1f}%)")
+
+    if n_singular > 0:
+        reasons = raw_df[raw_df['is_singular']]['singular_reason'].value_counts().to_dict()
+        print(f"      Singularity breakdown: {reasons}")
+
+    if gate_df.empty:
+        gate_df['p_interaction_fdr'] = []
+        gate_df['p_main_fdr']        = []
+        return gate_df, raw_df
+
     gate_df['p_interaction_fdr'] = multipletests(gate_df['p_interaction'], method='fdr_bh')[1]
     gate_df['p_main_fdr']        = multipletests(gate_df['p_main'],        method='fdr_bh')[1]
-    return gate_df
+    return gate_df, raw_df
 
 def binwise_localization(df, chan, feat, group_col, bin_col='bin_epoch_num'):
     collapsed = (
@@ -415,6 +540,16 @@ def cohens_d(x, y):
     return (x.mean() - y.mean()) / pooled
 
 # --- 6. Main pipeline — sweep over K values ---
+# Adopted optimal k* per dataset (matches Table 2 / Table 5 in main_long.tex)
+K_STAR_MAP = {
+    'korean':   15,
+    'giga':     22 if 22 in K_VALUES else 20,
+    'adaptive': 20,
+}
+
+all_sweep_records    = []
+all_scenario_records = []
+
 # results_by_dataset[dataset_name] = {'k': [], 'n_main': [], 'n_inter': []}
 results_by_dataset = {
     name: {'k': [], 'n_main': [], 'n_inter': []}
@@ -431,9 +566,9 @@ for k_val in K_VALUES:
         if not cfg.get('enabled', True):
             continue
 
-        # Skip K=1 for giga (large dataset)
+        # Skip K=1 for giga (large dataset: memory limit on OS)
         if dataset_name == 'giga' and k_val == 1:
-            print(f"  [skip] K=1 skipped for giga")
+            print(f"  [skip] K=1 skipped for giga (exceeds single-node memory limit)")
             continue
 
         print(f"\n  {'='*50}")
@@ -493,8 +628,9 @@ for k_val in K_VALUES:
         df_binned['bin_epoch_num'] = df_binned['bin_epoch_num'].astype('category')
 
         # Accumulate counts across all group variables
-        total_main  = 0
-        total_inter = 0
+        total_main     = 0
+        total_inter    = 0
+        scen_records_k = []
 
         for group_var, meta_dict in cfg['metadata'].items():
             meta_map = build_meta_map(meta_dict, group_var)
@@ -510,13 +646,80 @@ for k_val in K_VALUES:
                 print(f"    WARNING: multiple {group_var} labels per subject — skipping.")
                 continue
 
-            gate_df = run_lme(df, group_var, 'run_group', available_feats, available_chans)
+            gate_df, raw_df = run_lme(df, group_var, 'run_group', available_feats, available_chans)
 
-            n_main  = int((gate_df['p_main_fdr']        < 0.05).sum())
-            n_inter = int((gate_df['p_interaction_fdr'] < 0.05).sum())
+            n_main  = int((gate_df['p_main_fdr']        < 0.05).sum()) if not gate_df.empty else 0
+            n_inter = int((gate_df['p_interaction_fdr'] < 0.05).sum()) if not gate_df.empty else 0
             total_main  += n_main
             total_inter += n_inter
-            print(f"    [{group_var}]  main={n_main}  inter={n_inter}")
+
+            n_tot_scen  = len(raw_df)
+            n_conv_scen = int(raw_df['converged'].sum())
+            n_sing_scen = int(raw_df['is_singular'].sum())
+            n_surv_scen = len(gate_df)
+            pct_conv    = (n_conv_scen / n_tot_scen * 100.0) if n_tot_scen > 0 else 0.0
+            pct_sing    = (n_sing_scen / n_tot_scen * 100.0) if n_tot_scen > 0 else 0.0
+            pct_surv    = (n_surv_scen / n_tot_scen * 100.0) if n_tot_scen > 0 else 0.0
+
+            valid_re  = raw_df.loc[raw_df['converged'] & ~raw_df['is_singular'], 're_var'].dropna()
+            med_re    = float(valid_re.median()) if not valid_re.empty else 0.0
+
+            valid_icc = raw_df.loc[raw_df['converged'] & ~raw_df['is_singular'], 'icc'].dropna()
+            med_icc   = float(valid_icc.median()) if not valid_icc.empty else 0.0
+
+            valid_res = raw_df.loc[raw_df['converged'] & ~raw_df['is_singular'], 'resid_var'].dropna()
+            med_res   = float(valid_res.median()) if not valid_res.empty else 0.0
+
+            scen_rec = {
+                'dataset':             dataset_name,
+                'k':                   k_val,
+                'group_var':           group_var,
+                'total_models':        n_tot_scen,
+                'converged_models':    n_conv_scen,
+                'converged_pct':       pct_conv,
+                'singular_models':     n_sing_scen,
+                'singular_pct':        pct_sing,
+                'survived_models':     n_surv_scen,
+                'survived_pct':        pct_surv,
+                'median_re_var':       med_re,
+                'median_resid_var':    med_res,
+                'median_icc':          med_icc,
+                'main_effects':        n_main,
+                'interaction_effects': n_inter,
+            }
+            all_scenario_records.append(scen_rec)
+            scen_records_k.append(scen_rec)
+
+            print(f"    [{group_var}]  main={n_main}  inter={n_inter} | Conv: {pct_conv:.1f}% | Sing: {pct_sing:.1f}% | Surv: {pct_surv:.1f}%")
+
+        if scen_records_k:
+            df_k_scen       = pd.DataFrame(scen_records_k)
+            pooled_conv_pct = float(df_k_scen['converged_pct'].mean())
+            pooled_sing_pct = float(df_k_scen['singular_pct'].mean())
+            pooled_surv_pct = float(df_k_scen['survived_pct'].mean())
+            m_per_scen      = int(df_k_scen['total_models'].iloc[0])
+
+            # Median sigma_u^2 for sex/gender scenario (as reported in Table 5)
+            sex_row = df_k_scen[df_k_scen['group_var'] == 'gender']
+            if not sex_row.empty:
+                sex_re_var = float(sex_row['median_re_var'].iloc[0])
+                sex_icc    = float(sex_row['median_icc'].iloc[0])
+            else:
+                sex_re_var = float(df_k_scen['median_re_var'].median())
+                sex_icc    = float(df_k_scen['median_icc'].median())
+
+            all_sweep_records.append({
+                'dataset':             dataset_name,
+                'k':                   k_val,
+                'models_per_scenario': m_per_scen,
+                'conv_pct':            pooled_conv_pct,
+                'sing_pct':            pooled_sing_pct,
+                'surv_pct':            pooled_surv_pct,
+                're_var_sex':          sex_re_var,
+                'icc_sex':             sex_icc,
+                'main_effects':        total_main,
+                'interaction_effects': total_inter,
+            })
 
         results_by_dataset[dataset_name]['k'].append(k_val)
         results_by_dataset[dataset_name]['n_main'].append(total_main)
@@ -568,5 +771,139 @@ out_fig = 'k_sweep_effects_comparison_adaptive.png'
 plt.savefig(out_fig, dpi=150, bbox_inches='tight')
 print(f"\nPlot saved to: {out_fig}")
 plt.close()
+
+# ==============================================================================
+# 8. Summary Statistics Reports & Publication Tables (Console, CSV, LaTeX)
+# ==============================================================================
+
+def format_sci_latex(val):
+    """Format numerical variance for LaTeX tables (e.g. $1.9\\!\\times\\!10^{-12}$ or $0$)."""
+    if val is None or np.isnan(val) or val <= 0:
+        return "$0$"
+    if val < 1e-4:
+        exp = int(np.floor(np.log10(val)))
+        coeff = val / (10.0 ** exp)
+        return f"${coeff:.1f}\\!\\times\\!10^{{{exp}}}$"
+    return f"${val:.4f}$"
+
+def format_sci_text(val):
+    """Format numerical variance for clean terminal display."""
+    if val is None or np.isnan(val) or val <= 0:
+        return "0"
+    if val < 1e-4:
+        exp = int(np.floor(np.log10(val)))
+        coeff = val / (10.0 ** exp)
+        return f"{coeff:.1f}e{exp}"
+    return f"{val:.4f}"
+
+if all_sweep_records:
+    df_sweep = pd.DataFrame(all_sweep_records)
+    df_scen  = pd.DataFrame(all_scenario_records)
+
+    # 1. Export CSV summaries
+    out_sweep_csv = "k_sweep_stability_and_effects_summary.csv"
+    out_scen_csv  = "k_sweep_scenario_audit.csv"
+    df_sweep.to_csv(out_sweep_csv, index=False)
+    df_scen.to_csv(out_scen_csv, index=False)
+    print(f"\n[Exported] Summary CSV: {out_sweep_csv}")
+    print(f"[Exported] Scenario Audit CSV: {out_scen_csv}")
+
+    # 2. Formatted Console Table: Full K-Sweep Continuum (Table 5 style)
+    print("\n" + "=" * 98)
+    print("TABLE 5: LABEL-BLIND K-SWEEP STABILITY AND EFFECT COUNTS (ALL 3 DATASETS)")
+    print("Pooled across scenarios per dataset (* indicates adopted k* operating point)")
+    print("=" * 98)
+    header_t5 = f"{'Dataset':<10} {'k':<6} {'M':<6} {'Conv.%':<9} {'Sing.%':<9} {'Surv.%':<9} {'sigma2_u (sex)':<18} {'main':<7} {'int.':<6}"
+    print(header_t5)
+    print("-" * 98)
+
+    for rec in all_sweep_records:
+        dname     = rec['dataset'].capitalize()
+        kval      = rec['k']
+        is_k_star = (kval == K_STAR_MAP.get(rec['dataset']))
+        k_str     = f"{kval}*" if is_k_star else str(kval)
+        m_str     = str(rec['models_per_scenario'])
+        conv_str  = f"{rec['conv_pct']:.1f}%"
+        sing_str  = f"{rec['sing_pct']:.1f}%"
+        surv_str  = f"{rec['surv_pct']:.1f}%"
+        re_str    = format_sci_text(rec['re_var_sex'])
+        main_str  = str(rec['main_effects'])
+        int_str   = str(rec['interaction_effects'])
+        print(f"{dname:<10} {k_str:<6} {m_str:<6} {conv_str:<9} {sing_str:<9} {surv_str:<9} {re_str:<18} {main_str:<7} {int_str:<6}")
+    print("=" * 98)
+
+    # 3. Formatted Console Table: Three Operating Points (Table 2 style)
+    k_max = max(K_VALUES)
+    op_records = []
+    print("\n" + "=" * 82)
+    print(f"TABLE 2: THREE OPERATING POINTS (k=1, k=k*, k=k_max={k_max})")
+    print("Surviving BH-FDR (q < 0.05) effects pooled within each dataset across scenarios")
+    print("=" * 82)
+    print(f"{'Dataset':<12} {'k*':<6} {'k = 1':^20} {'k = k*':^20} {f'k = {k_max}':^20}")
+    print(f"{'':<12} {'':<6} {'main':^10} {'int.':^10} {'main':^10} {'int.':^10} {'main':^10} {'int.':^10}")
+    print("-" * 82)
+
+    for dname, cfg in dataset_configs.items():
+        if not cfg.get('enabled', True):
+            continue
+        k_star = K_STAR_MAP.get(dname, 15)
+
+        # Lookup k=1
+        r_k1 = df_sweep[(df_sweep['dataset'] == dname) & (df_sweep['k'] == 1)]
+        if not r_k1.empty:
+            k1_main = int(r_k1['main_effects'].iloc[0])
+            k1_int  = int(r_k1['interaction_effects'].iloc[0])
+            k1_main_str = str(k1_main)
+            k1_int_str  = str(k1_int)
+        else:
+            k1_main = np.nan
+            k1_int  = np.nan
+            k1_main_str = "--"
+            k1_int_str  = "--"
+
+        # Lookup k=k*
+        r_kstar = df_sweep[(df_sweep['dataset'] == dname) & (df_sweep['k'] == k_star)]
+        if not r_kstar.empty:
+            ks_main = int(r_kstar['main_effects'].iloc[0])
+            ks_int  = int(r_kstar['interaction_effects'].iloc[0])
+            ks_main_str = str(ks_main)
+            ks_int_str  = str(ks_int)
+        else:
+            ks_main = np.nan
+            ks_int  = np.nan
+            ks_main_str = "--"
+            ks_int_str  = "--"
+
+        # Lookup k=k_max
+        r_kmax = df_sweep[(df_sweep['dataset'] == dname) & (df_sweep['k'] == k_max)]
+        if not r_kmax.empty:
+            km_main = int(r_kmax['main_effects'].iloc[0])
+            km_int  = int(r_kmax['interaction_effects'].iloc[0])
+            km_main_str = str(km_main)
+            km_int_str  = str(km_int)
+        else:
+            km_main = np.nan
+            km_int  = np.nan
+            km_main_str = "--"
+            km_int_str  = "--"
+
+        op_records.append({
+            'dataset':    dname.capitalize(),
+            'k_star':     k_star,
+            'k1_main':    k1_main_str,
+            'k1_int':     k1_int_str,
+            'kstar_main': ks_main_str,
+            'kstar_int':  ks_int_str,
+            'kmax_main':  km_main_str,
+            'kmax_int':   km_int_str,
+        })
+
+        print(f"{dname.capitalize():<12} {k_star:<6} {k1_main_str:^10} {k1_int_str:^10} {ks_main_str:^10} {ks_int_str:^10} {km_main_str:^10} {km_int_str:^10}")
+    print("=" * 82)
+
+    df_op = pd.DataFrame(op_records)
+    out_op_csv = "k_sweep_operating_points_summary.csv"
+    df_op.to_csv(out_op_csv, index=False)
+    print(f"[Exported] Operating Points CSV: {out_op_csv}")
 
 print("\nAll datasets complete.")
