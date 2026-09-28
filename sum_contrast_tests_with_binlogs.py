@@ -164,7 +164,7 @@ dataset_configs = {
         'epoch_type':     'target',
         'channels':       [
             'fp1', 'f7', 'f3', 'fc1', 'fc5', 'c4', 'cp2', 'fc6',
-            'f8', 'f4', 'fc2', 'fp2', 'fz', 'cz', 'cp1', 'pz', 'oz', 'po4', 'p4'
+            'f8', 'f4', 'fc2', 'fp2', 'fz', 'cz', 'cp1', 'pz'
         ],
         'features':       None,
         'group_cols':     ['subject_id', 'run_type', 'run_id'],
