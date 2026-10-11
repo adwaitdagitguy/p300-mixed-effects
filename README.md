@@ -14,6 +14,7 @@ Note:
 Some of the data were shifted to azure cloud from AWS, so the data fetching may differ in a few files, but the algorithm follows the pipeline
 
 We are grateful to the creators of the datasets, viz
+
 [ADAPTIVE]
 Noble, S.C., Woods, E., Ward, T., Ringwood, J.V.: Data for: Adaptive P300-based
 brain-computer interface for attention training. Zenodo (2023). https://doi.org/
