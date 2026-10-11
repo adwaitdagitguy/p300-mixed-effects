@@ -7,7 +7,7 @@ Analysis with Principled Epoch Aggregation
 by: Adwait Patkhedkar, Komal Tarachandani and Kiran Talele
 [Accepted at the 19th Brain Informatics (BI'26) Conference]
 
-<img width="3432" height="2213" alt="pipeline_conf (1)" src="https://github.com/user-attachments/assets/0e92a284-5e05-4178-833e-35307c24575a" />
+<img width="3431" height="2211" alt="preprocessing_camera_ready (1)" src="https://github.com/user-attachments/assets/52f3c965-4952-4f01-84b4-17f297eb8e39" />
 
 
 Note:
